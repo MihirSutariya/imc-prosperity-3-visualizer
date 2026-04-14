@@ -43,6 +43,124 @@ function getColumnValues(columns: string[], indices: number[]): number[] {
   return values;
 }
 
+/** One semicolon-separated activities row (Prosperity 3 & 4 CSV). */
+function parseActivityLogLine(line: string): ActivityLogRow {
+  const columns = line.split(';');
+
+  return {
+    day: Number(columns[0]),
+    timestamp: Number(columns[1]),
+    product: columns[2],
+    bidPrices: getColumnValues(columns, [3, 5, 7]),
+    bidVolumes: getColumnValues(columns, [4, 6, 8]),
+    askPrices: getColumnValues(columns, [9, 11, 13]),
+    askVolumes: getColumnValues(columns, [10, 12, 14]),
+    midPrice: Number(columns[15]),
+    profitLoss: Number(columns[16]),
+  };
+}
+
+/** Prosperity 4+ server export: one JSON object (often a single physical line). */
+export interface ProsperityJsonLogFile {
+  submissionId?: string;
+  activitiesLog: string;
+  logs: ProsperityJsonLogEntry[];
+  tradeHistory?: unknown[];
+}
+
+export interface ProsperityJsonLogEntry {
+  lambdaLog: string;
+  sandboxLog: string;
+  timestamp?: number;
+}
+
+function tryParseProsperityJsonLogFile(logs: unknown): ProsperityJsonLogFile | null {
+  let obj: unknown = logs;
+
+  if (typeof logs === 'string') {
+    const trimmed = logs.trim();
+    if (!trimmed.startsWith('{')) {
+      return null;
+    }
+
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  if (obj === null || typeof obj !== 'object') {
+    return null;
+  }
+
+  const candidate = obj as Record<string, unknown>;
+  if (typeof candidate.activitiesLog !== 'string' || !Array.isArray(candidate.logs)) {
+    return null;
+  }
+
+  return {
+    submissionId: typeof candidate.submissionId === 'string' ? candidate.submissionId : undefined,
+    activitiesLog: candidate.activitiesLog,
+    logs: candidate.logs as ProsperityJsonLogEntry[],
+    tradeHistory: Array.isArray(candidate.tradeHistory) ? candidate.tradeHistory : undefined,
+  };
+}
+
+/** Activities CSV from Prosperity 4 `activitiesLog` string (header row optional). */
+function getActivityLogsFromActivitiesCsv(activitiesLog: string): ActivityLogRow[] {
+  const lines = activitiesLog.trim().split(/\r?\n/).filter(line => line.length > 0);
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const firstCell = lines[0].split(';')[0] ?? '';
+  const dataLines = Number.isNaN(Number(firstCell)) ? lines.slice(1) : lines;
+
+  const rows: ActivityLogRow[] = [];
+  for (const line of dataLines) {
+    if (line === '') {
+      break;
+    }
+
+    rows.push(parseActivityLogLine(line));
+  }
+
+  return rows;
+}
+
+function getAlgorithmDataFromJsonLogs(entries: ProsperityJsonLogEntry[]): AlgorithmDataRow[] {
+  const rows: AlgorithmDataRow[] = [];
+
+  for (const entry of entries) {
+    const line = entry.lambdaLog;
+    if (line === undefined || line.trim() === '') {
+      continue;
+    }
+
+    const sandboxLogs = (entry.sandboxLog ?? '').trim();
+
+    try {
+      const compressedDataRow = JSON.parse(line) as CompressedAlgorithmDataRow;
+      rows.push(decompressDataRow(compressedDataRow, sandboxLogs));
+    } catch (err) {
+      console.log(line);
+      console.error(err);
+
+      throw new AlgorithmParseError(
+        (
+          <>
+            <Text>Logs are in invalid format. Could not parse the following lambdaLog:</Text>
+            <Text>{line}</Text>
+          </>
+        ),
+      );
+    }
+  }
+
+  return rows;
+}
+
 function getActivityLogs(logLines: string[]): ActivityLogRow[] {
   const headerIndex = logLines.indexOf('Activities log:');
   if (headerIndex === -1) {
@@ -57,19 +175,7 @@ function getActivityLogs(logLines: string[]): ActivityLogRow[] {
       break;
     }
 
-    const columns = line.split(';');
-
-    rows.push({
-      day: Number(columns[0]),
-      timestamp: Number(columns[1]),
-      product: columns[2],
-      bidPrices: getColumnValues(columns, [3, 5, 7]),
-      bidVolumes: getColumnValues(columns, [4, 6, 8]),
-      askPrices: getColumnValues(columns, [9, 11, 13]),
-      askVolumes: getColumnValues(columns, [10, 12, 14]),
-      midPrice: Number(columns[15]),
-      profitLoss: Number(columns[16]),
-    });
+    rows.push(parseActivityLogLine(line));
   }
 
   return rows;
@@ -82,7 +188,7 @@ function decompressListings(compressed: CompressedListing[]): Record<ProsperityS
     listings[symbol] = {
       symbol,
       product,
-      denomination,
+      denomination: typeof denomination === 'string' ? denomination : String(denomination),
     };
   }
 
@@ -250,11 +356,21 @@ function getAlgorithmData(logLines: string[]): AlgorithmDataRow[] {
   return rows;
 }
 
-export function parseAlgorithmLogs(logs: string, summary?: AlgorithmSummary): Algorithm {
-  const logLines = logs.trim().split(/\r?\n/);
+export function parseAlgorithmLogs(logs: string | ProsperityJsonLogFile, summary?: AlgorithmSummary): Algorithm {
+  const jsonFile = tryParseProsperityJsonLogFile(logs);
 
-  const activityLogs = getActivityLogs(logLines);
-  const data = getAlgorithmData(logLines);
+  let activityLogs: ActivityLogRow[];
+  let data: AlgorithmDataRow[];
+
+  if (jsonFile !== null) {
+    activityLogs = getActivityLogsFromActivitiesCsv(jsonFile.activitiesLog);
+    data = getAlgorithmDataFromJsonLogs(jsonFile.logs);
+  } else {
+    const logLines = (typeof logs === 'string' ? logs : JSON.stringify(logs)).trim().split(/\r?\n/);
+
+    activityLogs = getActivityLogs(logLines);
+    data = getAlgorithmData(logLines);
+  }
 
   if (activityLogs.length === 0 && data.length === 0) {
     throw new AlgorithmParseError(

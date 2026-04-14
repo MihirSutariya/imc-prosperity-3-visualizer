@@ -103,7 +103,7 @@ export interface Algorithm {
   data: AlgorithmDataRow[];
 }
 
-export type CompressedListing = [symbol: ProsperitySymbol, product: Product, denomination: Product];
+export type CompressedListing = [symbol: ProsperitySymbol, product: Product, denomination: Product | number];
 
 export type CompressedOrderDepth = [buyOrders: Record<number, number>, sellOrders: Record<number, number>];
 
